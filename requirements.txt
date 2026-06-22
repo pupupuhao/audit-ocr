@@ -1,0 +1,9 @@
+paddlepaddle
+paddleocr
+pymupdf
+opencv-python
+pillow
+numpy
+pandas
+openpyxl
+rapidocr-onnxruntime
