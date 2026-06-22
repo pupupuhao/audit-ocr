@@ -27,7 +27,7 @@ from src.llm_extractor import (
 from src.html_table_parser import parse_html_tables
 from src.markdown_table_parser import parse_markdown_tables
 from src.document_info_extractor import extract_document_info
-from src.field_extractor import extract_construction_processes_from_pages
+from src.field_extractor import extract_construction_processes_from_pages, extract_sub_item_project_rows
 from src.business_extractor import classify_page as classify_page_by_rules
 from src.models import AuditProject, SubProject
 from src.sub_project_normalizer import clean_sub_project_name, normalize_sub_project_ids
@@ -50,6 +50,188 @@ ROW_TYPE_MAP = {
 
 SUB_TABLE_TYPES = {"labor_table", "material_table", "machine_table"}
 MAX_CELL_CHARS = 500
+
+
+def clean_amount_value(value: Any) -> str:
+    return re.sub(r"[^\d.]", "", str(value or ""))
+
+
+def compact_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def is_number_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    text = re.sub(r"[￥¥,\s]", "", text)
+    return bool(text and re.fullmatch(r"\d+(?:\.\d+)?", text))
+
+
+def find_table_column(grid: list[Any], keywords: list[str], max_rows: int = 8) -> int | None:
+    by_col: dict[int, list[str]] = {}
+    for row in grid[:max_rows]:
+        if not isinstance(row, list):
+            continue
+        for col_index, cell in enumerate(row):
+            by_col.setdefault(col_index, []).append(str(cell or ""))
+
+    for col_index, values in by_col.items():
+        combined = compact_text(" ".join(values))
+        if all(compact_text(keyword) in combined for keyword in keywords):
+            return col_index
+    return None
+
+
+def find_best_grid_row_for_sub_item(row: dict[str, Any], grid: list[Any]) -> list[str] | None:
+    best_score = 0
+    best_row: list[str] | None = None
+    seq = str(row.get("seq", "") or "").strip()
+    project_code = str(row.get("project_code", "") or "").strip()
+    project_name = compact_text(row.get("project_name", ""))
+    quantity = clean_amount_value(row.get("quantity"))
+    total_price = clean_amount_value(row.get("total_price"))
+
+    for raw_row in grid:
+        if not isinstance(raw_row, list):
+            continue
+        cells = [str(cell or "").strip() for cell in raw_row]
+        row_compact = compact_text(" ".join(cells))
+        amount_cells = [clean_amount_value(cell) for cell in cells]
+        score = 0
+        if seq and any(cell == seq for cell in cells):
+            score += 3
+        if project_code and any(cell == project_code for cell in cells):
+            score += 5
+        if project_name and project_name in row_compact:
+            score += 3
+        if quantity and quantity in amount_cells:
+            score += 2
+        if total_price and total_price in amount_cells:
+            score += 3
+        if score > best_score:
+            best_score = score
+            best_row = cells
+
+    return best_row if best_score >= 5 else None
+
+
+def find_unit_price_in_grid_row(row: dict[str, Any], cells: list[str], unit_price_col: int | None, total_col: int | None) -> str:
+    total_price = clean_amount_value(row.get("total_price"))
+    quantity = clean_amount_value(row.get("quantity"))
+    seq = str(row.get("seq", "") or "").strip()
+
+    scan_from = None
+    if total_price:
+        for index, cell in enumerate(cells):
+            if clean_amount_value(cell) == total_price:
+                scan_from = index
+                break
+
+    if scan_from is not None:
+        for index in range(scan_from - 1, -1, -1):
+            value = clean_amount_value(cells[index]) if is_number_text(cells[index]) else ""
+            if value and value not in {quantity, seq}:
+                return value
+
+    if unit_price_col is not None and unit_price_col < len(cells):
+        value = clean_amount_value(cells[unit_price_col]) if is_number_text(cells[unit_price_col]) else ""
+        if value and value not in {quantity, seq, total_price}:
+            return value
+
+    scan_from = total_col
+    if scan_from is not None:
+        for index in range(scan_from - 1, -1, -1):
+            value = clean_amount_value(cells[index]) if is_number_text(cells[index]) else ""
+            if value and value not in {quantity, seq, total_price}:
+                return value
+
+    if quantity:
+        quantity_index = None
+        for index, cell in enumerate(cells):
+            if clean_amount_value(cell) == quantity:
+                quantity_index = index
+                break
+        if quantity_index is not None:
+            for cell in cells[quantity_index + 1:]:
+                value = clean_amount_value(cell) if is_number_text(cell) else ""
+                if value and value != total_price:
+                    return value
+
+    return ""
+
+
+def backfill_sub_item_unit_price_directly(rows: list[dict[str, Any]], table: dict[str, Any]) -> list[dict[str, Any]]:
+    grid = table.get("grid", [])
+    if not isinstance(grid, list) or not grid:
+        return rows
+
+    unit_price_col = find_table_column(grid, ["综合单价"])
+    total_col = find_table_column(grid, ["合价"])
+
+    for row in rows:
+        if clean_amount_value(row.get("unit_price")):
+            continue
+        cells = find_best_grid_row_for_sub_item(row, grid)
+        if not cells:
+            continue
+        unit_price = find_unit_price_in_grid_row(row, cells, unit_price_col, total_col)
+        if unit_price:
+            row["unit_price"] = unit_price
+    return rows
+
+
+def backfill_sub_item_unit_price_from_grid(
+    rows: list[dict[str, Any]],
+    table: dict[str, Any],
+    page_no: int,
+) -> list[dict[str, Any]]:
+    """Fill Qwen-missed unit_price values from the same VL table grid."""
+    if not rows:
+        return rows
+
+    rule_rows = [
+        row.to_dict()
+        for row in extract_sub_item_project_rows(table, page_no=page_no)
+        if is_number_text(row.unit_price)
+    ]
+    if not rule_rows:
+        return backfill_sub_item_unit_price_directly(rows, table)
+
+    by_project_code = {
+        str(row.get("project_code", "") or "").strip(): row
+        for row in rule_rows
+        if str(row.get("project_code", "") or "").strip()
+    }
+    by_seq_name = {
+        (
+            str(row.get("seq", "") or "").strip(),
+            str(row.get("project_name", "") or "").strip(),
+        ): row
+        for row in rule_rows
+        if str(row.get("seq", "") or "").strip() or str(row.get("project_name", "") or "").strip()
+    }
+
+    for index, row in enumerate(rows):
+        if clean_amount_value(row.get("unit_price")):
+            continue
+
+        project_code = str(row.get("project_code", "") or "").strip()
+        seq_name_key = (
+            str(row.get("seq", "") or "").strip(),
+            str(row.get("project_name", "") or "").strip(),
+        )
+        source_row = by_project_code.get(project_code) if project_code else None
+        if source_row is None:
+            source_row = by_seq_name.get(seq_name_key)
+        if source_row is None and index < len(rule_rows):
+            source_row = rule_rows[index]
+        if source_row is None:
+            continue
+
+        unit_price = clean_amount_value(source_row.get("unit_price")) if is_number_text(source_row.get("unit_price")) else ""
+        if unit_price:
+            row["unit_price"] = unit_price
+
+    return backfill_sub_item_unit_price_directly(rows, table)
 
 
 def should_switch_sub_project(rule_table_types: list[str], current_sub_project: str) -> bool:
@@ -660,6 +842,12 @@ def main() -> None:
 
                     raw_rows = extract_table_data(table, llm_table_type)
                     normalized = normalize_data(raw_rows, llm_table_type)
+                    if llm_table_type == "sub_item_project_table":
+                        normalized = backfill_sub_item_unit_price_from_grid(
+                            normalized,
+                            table,
+                            page_no,
+                        )
                     if llm_table_type in ROW_TYPE_MAP and current_sub_project:
                         add_rows_to_project_state(
                             table_type=llm_table_type,
