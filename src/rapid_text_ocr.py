@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .path_compat import ascii_temp_image_path
 from .utils import ensure_dir, make_json_safe, page_file_name, write_json
 
 _RAPID_OCR_ENGINE: Any | None = None
@@ -70,7 +71,8 @@ def run_rapid_text_ocr(
         rec_keys_path=rec_keys_path,
     )
     started_at = time.perf_counter()
-    raw_result, rapid_elapse = engine(image_path)
+    with ascii_temp_image_path(image_path) as engine_image_path:
+        raw_result, rapid_elapse = engine(engine_image_path)
     wall_seconds = round(time.perf_counter() - started_at, 4)
 
     result = {

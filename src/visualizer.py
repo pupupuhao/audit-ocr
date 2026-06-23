@@ -9,6 +9,23 @@ import numpy as np
 from .utils import ensure_dir
 
 
+def _read_image_unicode(path: str) -> np.ndarray | None:
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def _write_image_unicode(path: str | Path, image: np.ndarray) -> bool:
+    target = Path(path)
+    suffix = target.suffix or ".png"
+    success, buffer = cv2.imencode(suffix, image)
+    if not success:
+        return False
+    buffer.tofile(str(target))
+    return True
+
+
 def _points_from_bbox(bbox: Any) -> np.ndarray | None:
     try:
         points = np.array(bbox, dtype=np.int32)
@@ -20,7 +37,7 @@ def _points_from_bbox(bbox: Any) -> np.ndarray | None:
 
 
 def draw_ocr_boxes(image_path: str, ocr_result: dict, output_path: str) -> None:
-    image = cv2.imread(str(image_path))
+    image = _read_image_unicode(str(image_path))
     if image is None:
         raise ValueError(f"Cannot read image: {image_path}")
 
@@ -59,4 +76,5 @@ def draw_ocr_boxes(image_path: str, ocr_result: dict, output_path: str) -> None:
 
     target = Path(output_path)
     ensure_dir(target.parent)
-    cv2.imwrite(str(target), image)
+    if not _write_image_unicode(target, image):
+        raise ValueError(f"Cannot write image: {output_path}")

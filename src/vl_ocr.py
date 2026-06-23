@@ -4,6 +4,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .path_compat import ascii_temp_image_path
 from .utils import ensure_dir, make_json_safe, page_file_name, write_json
 
 _VL_ENGINE: Any | None = None
@@ -101,7 +102,8 @@ def _summarize_vl_json(raw_json: dict[str, Any]) -> dict[str, Any]:
 def run_vl_ocr(image_path: str, output_dir: str, page_no: int) -> dict:
     output = ensure_dir(output_dir)
     engine = _get_vl_engine()
-    raw_results = list(engine.predict(image_path))
+    with ascii_temp_image_path(image_path) as engine_image_path:
+        raw_results = list(engine.predict(engine_image_path))
     page_payloads: list[dict[str, Any]] = []
     markdown_parts: list[str] = []
     html_count = 0
